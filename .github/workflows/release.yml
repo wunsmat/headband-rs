@@ -11,22 +11,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bin: target/release/headband-rs
             out: headband
           - os: windows-latest
-            bin: target/release/headband-rs.exe
             out: headband.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - run: cp ${{ matrix.bin }} ${{ matrix.out }}
-        shell: bash
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
-          path: ${{ matrix.out }}
+          path: target/release/${{ matrix.out }}
 
   release:
     needs: build

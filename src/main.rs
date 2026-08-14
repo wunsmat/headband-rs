@@ -368,16 +368,16 @@ fn status(app: &App) -> Vec<Line<'static>> {
                     lines.push(Line::from(vec![
                         Span::raw("Friends run  "),
                         Span::styled(format!("headband {}", local_ip(&app.port)), accent),
-                        Span::styled(" ⧉", dim),
-                        Span::styled("   same wifi", dim),
+                        Span::styled(" ⧉ ", dim),
+                        Span::styled("  same wifi", dim),
                     ]));
                     let ip = app.pub_ip.lock().unwrap().clone();
                     if !ip.is_empty() {
                         lines.push(Line::from(vec![
                             Span::raw("          or "),
                             Span::styled(format!("headband {}:{}", ip, app.port), accent),
-                            Span::styled(" ⧉", dim),
-                            Span::styled("   internet", dim),
+                            Span::styled(" ⧉ ", dim),
+                            Span::styled("  internet", dim),
                         ]));
                     }
                 }
@@ -575,11 +575,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .iter()
         .enumerate()
         .filter_map(|(i, l)| {
-            let addr = l
+            let cmd = l
                 .spans
                 .iter()
-                .find_map(|s| s.content.strip_prefix("headband "))?;
-            Some((rows[1].y + i as u16, addr.to_string()))
+                .find(|s| s.content.starts_with("headband "))?;
+            Some((rows[1].y + i as u16, cmd.content.to_string()))
         })
         .collect();
 
@@ -1100,7 +1100,13 @@ mod tests {
         let lines = render(&mut app, 100, 20);
 
         assert_eq!(app.share.len(), 2, "both addresses should be clickable");
-        assert!(app.share.iter().any(|(_, a)| a == "1.2.3.4:7777"));
+        assert!(
+            app.share
+                .iter()
+                .any(|(_, a)| a == "headband 1.2.3.4:7777"),
+            "the runnable command should be copied, not the bare address: {:?}",
+            app.share
+        );
         for (row, addr) in &app.share {
             assert!(
                 lines[*row as usize].contains(addr.as_str()),
@@ -1133,6 +1139,33 @@ mod tests {
         app.state.phase = "play".into();
         render(&mut app, 100, 20);
         assert!(app.share.is_empty(), "stale rows must not stay clickable");
+    }
+
+    #[test]
+    fn the_copy_icon_gets_a_second_cell_of_its_own_style() {
+        let mut app = App::new(None, "7777".into());
+        app.joined = true;
+        app.state.phase = "lobby".into();
+        app.state.players = vec![Player {
+            name: "Matt".into(),
+            ..Default::default()
+        }];
+        let lines = render(&mut app, 100, 20);
+        let (row, _) = app.share[0].clone();
+        let icon = lines[row as usize]
+            .chars()
+            .position(|c| c == '⧉')
+            .expect("no copy icon") as u16;
+
+        for hover in [None, Some(row)] {
+            app.hover = hover;
+            let cells = styles(&mut app, 100, 20, row);
+            assert_eq!(
+                cells[icon as usize],
+                cells[icon as usize + 1],
+                "a double-wide font would straddle two styles (hover: {hover:?})"
+            );
+        }
     }
 
     #[test]

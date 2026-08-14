@@ -1,6 +1,7 @@
 mod host;
 mod notes;
 
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEventKind,
@@ -37,6 +38,9 @@ struct App {
     you: usize,
     joined: bool,
     err: String,
+    flash: String,
+    share: Vec<(u16, String)>,
+    hover: Option<u16>,
     pub_ip: Arc<Mutex<String>>,
     entry: Notes,
     notes: Notes,
@@ -62,6 +66,9 @@ impl App {
             you: 0,
             joined: false,
             err: String::new(),
+            flash: String::new(),
+            share: Vec::new(),
+            hover: None,
             pub_ip: Arc::new(Mutex::new(String::new())),
             entry: Notes::new(),
             notes: Notes::new(),
@@ -190,6 +197,7 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        self.flash.clear();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
@@ -251,7 +259,26 @@ impl App {
             .saturating_sub(self.log_rect.height as usize)
     }
 
+    fn copy_share(&mut self, y: u16) -> bool {
+        let Some((_, addr)) = self.share.iter().find(|(row, _)| *row == y) else {
+            return false;
+        };
+        let addr = addr.clone();
+        self.flash = match execute!(
+            std::io::stdout(),
+            CopyToClipboard::to_clipboard_from(addr.clone())
+        ) {
+            Ok(()) => format!("copied {addr}"),
+            Err(e) => format!("could not copy: {e}"),
+        };
+        true
+    }
+
     fn on_mouse(&mut self, x: u16, y: u16, kind: MouseEventKind) {
+        self.hover = Some(y);
+        if kind == MouseEventKind::Down(MouseButton::Left) && self.copy_share(y) {
+            return;
+        }
         let in_notes = self.notes_inner.contains(Position::new(x, y));
         let in_log = self.log_rect.contains(Position::new(x, y));
         match kind {
@@ -333,7 +360,7 @@ fn status(app: &App) -> Vec<Line<'static>> {
     match app.state.phase.as_str() {
         "lobby" => {
             let mut lines = vec![Line::styled(
-                format!("Lobby — {} connected.", p.len()),
+                format!("Lobby: {} connected.", p.len()),
                 accent,
             )];
             match &app.addr {
@@ -341,6 +368,7 @@ fn status(app: &App) -> Vec<Line<'static>> {
                     lines.push(Line::from(vec![
                         Span::raw("Friends run  "),
                         Span::styled(format!("headband {}", local_ip(&app.port)), accent),
+                        Span::styled(" ⧉", dim),
                         Span::styled("   same wifi", dim),
                     ]));
                     let ip = app.pub_ip.lock().unwrap().clone();
@@ -348,7 +376,8 @@ fn status(app: &App) -> Vec<Line<'static>> {
                         lines.push(Line::from(vec![
                             Span::raw("          or "),
                             Span::styled(format!("headband {}:{}", ip, app.port), accent),
-                            Span::styled("   internet — needs port forward or tailscale", dim),
+                            Span::styled(" ⧉", dim),
+                            Span::styled("   internet", dim),
                         ]));
                     }
                 }
@@ -416,7 +445,7 @@ fn roster(app: &App) -> Vec<Line<'static>> {
             let thing = if me && !q.done {
                 "???".to_string()
             } else if q.thing.is_empty() {
-                "—".to_string()
+                "-".to_string()
             } else {
                 q.thing.clone()
             };
@@ -495,14 +524,19 @@ fn wrap(items: &[&str], sep: &str, width: u16) -> Vec<String> {
 
 fn ui(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let help_lines = {
+    let (help_lines, colour) = {
         let w = screen.width.saturating_sub(2);
         if !app.err.is_empty() {
-            wrap(&app.err.split(' ').collect::<Vec<_>>(), " ", w)
+            (wrap(&app.err.split(' ').collect::<Vec<_>>(), " ", w), BAD)
+        } else if !app.flash.is_empty() {
+            (
+                wrap(&app.flash.split(' ').collect::<Vec<_>>(), " ", w),
+                ACCENT,
+            )
         } else if app.hotkeys_hidden {
-            Vec::new()
+            (Vec::new(), DIM)
         } else {
-            wrap(&help_keys(app), " · ", w)
+            (wrap(&help_keys(app), " · ", w), DIM)
         }
     };
     let outer = Layout::vertical([
@@ -511,7 +545,6 @@ fn ui(frame: &mut Frame, app: &mut App) {
     ])
     .split(screen);
 
-    let colour = if app.err.is_empty() { DIM } else { BAD };
     let footer: Vec<Line> = help_lines
         .into_iter()
         .map(|l| Line::styled(l, Style::new().fg(colour)))
@@ -523,7 +556,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     } else {
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(outer[0])
     };
-    let status_lines = status(app);
+    let mut status_lines = status(app);
     let roster_lines = roster(app);
     let rows = Layout::vertical([
         Constraint::Length(2),
@@ -538,6 +571,32 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Paragraph::new(Line::styled("HEADBAND", Style::new().fg(ACCENT).bold())),
         rows[0],
     );
+    app.share = status_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let addr = l
+                .spans
+                .iter()
+                .find_map(|s| s.content.strip_prefix("headband "))?;
+            Some((rows[1].y + i as u16, addr.to_string()))
+        })
+        .collect();
+
+    let hovered = app
+        .hover
+        .filter(|hy| app.share.iter().any(|(row, _)| row == hy))
+        .map(|hy| (hy - rows[1].y) as usize);
+    if let Some(spans) = hovered.map(|i| &mut status_lines[i].spans)
+        && let Some(j) = spans
+            .iter()
+            .position(|s| s.content.starts_with("headband "))
+    {
+        spans[j].style = spans[j].style.underlined();
+        if let Some(icon) = spans.get_mut(j + 1) {
+            icon.style = Style::new().fg(ACCENT).bold();
+        }
+    }
     frame.render_widget(
         Paragraph::new(status_lines).wrap(Wrap { trim: false }),
         rows[1],
@@ -565,7 +624,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         log.insert(
             0,
             Line::styled(
-                format!("▲ {} older — scroll down for the latest", app.log_scroll),
+                format!("▲ {} older, scroll down for the latest", app.log_scroll),
                 Style::new().fg(BAD),
             ),
         );
@@ -592,7 +651,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
     } else {
         Line::styled(
-            "  (nothing to type — you're taking notes)",
+            "  (nothing to type, you're taking notes)",
             Style::new().fg(DIM),
         )
     };
@@ -781,6 +840,13 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn styles(app: &mut App, w: u16, h: u16, row: u16) -> Vec<Style> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..w).map(|x| buf[(x, row)].style()).collect()
     }
 
     fn playing() -> App {
@@ -1019,6 +1085,54 @@ mod tests {
         }
         assert_eq!(app.entry.lines[0], "duck");
         assert!(app.notes.is_empty(), "notes must not have swallowed it");
+    }
+
+    #[test]
+    fn lobby_addresses_are_clickable_rows() {
+        let mut app = App::new(None, "7777".into());
+        app.joined = true;
+        app.state.phase = "lobby".into();
+        app.state.players = vec![Player {
+            name: "Matt".into(),
+            ..Default::default()
+        }];
+        *app.pub_ip.lock().unwrap() = "1.2.3.4".into();
+        let lines = render(&mut app, 100, 20);
+
+        assert_eq!(app.share.len(), 2, "both addresses should be clickable");
+        assert!(app.share.iter().any(|(_, a)| a == "1.2.3.4:7777"));
+        for (row, addr) in &app.share {
+            assert!(
+                lines[*row as usize].contains(addr.as_str()),
+                "row {row} does not hold {addr}: {:?}",
+                lines[*row as usize]
+            );
+            assert!(lines[*row as usize].contains('⧉'), "no copy icon on {addr}");
+        }
+
+        let miss = app.log_rect.y;
+        assert!(!app.copy_share(miss), "only the address rows copy");
+
+        let (row, _) = app.share[0].clone();
+        let plain = styles(&mut app, 100, 20, row);
+        app.on_mouse(0, row, MouseEventKind::Moved);
+        let hot = styles(&mut app, 100, 20, row);
+        assert_ne!(plain, hot, "hovered row should look different");
+        assert!(
+            hot.iter()
+                .any(|s| s.add_modifier.contains(Modifier::UNDERLINED)),
+            "address should underline on hover"
+        );
+        app.on_mouse(0, miss, MouseEventKind::Moved);
+        assert_eq!(
+            styles(&mut app, 100, 20, row),
+            plain,
+            "highlight should drop when the mouse leaves"
+        );
+
+        app.state.phase = "play".into();
+        render(&mut app, 100, 20);
+        assert!(app.share.is_empty(), "stale rows must not stay clickable");
     }
 
     #[test]

@@ -91,11 +91,11 @@ impl Host {
     pub fn apply(&mut self, me: usize, c: Cmd) {
         match c.cmd.as_str() {
             "start" if me == 0 && self.state.phase == "lobby" && self.live().len() >= 2 => {
-                self.new_round("Assign phase — everyone name the thing for their target.");
+                self.new_round("Assign phase: everyone name the thing for their target.");
             }
             "restart" if me == 0 && self.state.phase != "lobby" && self.live().len() >= 2 => {
                 self.state.log.clear();
-                self.new_round("New round — assign again.");
+                self.new_round("New round, assign again.");
             }
             "thing"
                 if self.state.phase == "assign"
@@ -116,7 +116,7 @@ impl Host {
                     self.state.players[me].done = true;
                     self.log(&format!("{name} got it: {thing} ✓"));
                 } else {
-                    self.log(&format!("{name} guessed \"{}\" — nope.", c.text));
+                    self.log(&format!("{name} guessed \"{}\": nope.", c.text));
                 }
                 self.next_turn();
             }
@@ -134,7 +134,7 @@ impl Host {
             "assign" => {
                 let owed = self.state.assigns.get(me).copied().unwrap_or(-1);
                 if owed >= 0 && self.state.players[owed as usize].thing.is_empty() {
-                    self.new_round("Redrawing — they left before assigning.");
+                    self.new_round("Redrawing: they left before assigning.");
                 }
                 self.start_play();
             }

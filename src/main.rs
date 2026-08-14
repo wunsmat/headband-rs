@@ -46,6 +46,8 @@ struct App {
     entry_rect: Rect,
     log_rect: Rect,
     log_scroll: usize,
+    notes_hidden: bool,
+    hotkeys_hidden: bool,
     quit: bool,
 }
 
@@ -69,6 +71,8 @@ impl App {
             entry_rect: Rect::ZERO,
             log_rect: Rect::ZERO,
             log_scroll: 0,
+            notes_hidden: false,
+            hotkeys_hidden: false,
             quit: false,
         }
     }
@@ -173,11 +177,15 @@ impl App {
             self.state = u.state;
             self.you = u.you;
             self.joined = true;
-            let now = self.active();
-            if now != self.was_active {
-                self.was_active = now;
-                self.on_notes = !now;
-            }
+            self.refocus();
+        }
+    }
+
+    fn refocus(&mut self) {
+        let now = self.active();
+        if now != self.was_active {
+            self.was_active = now;
+            self.on_notes = !now && !self.notes_hidden;
         }
     }
 
@@ -196,6 +204,12 @@ impl App {
                     ..Default::default()
                 })
             }
+            KeyCode::Char('n') if ctrl => {
+                self.notes_hidden = !self.notes_hidden;
+                if self.notes_hidden {
+                    self.on_notes = false;
+                }
+            }
             KeyCode::Char('u') if ctrl => {
                 self.log_scroll = (self.log_scroll + self.log_page()).min(self.max_log_scroll())
             }
@@ -203,7 +217,7 @@ impl App {
                 self.log_scroll = self.log_scroll.saturating_sub(self.log_page())
             }
             KeyCode::Tab => {
-                if self.active() {
+                if self.active() && !self.notes_hidden {
                     self.on_notes = !self.on_notes;
                 }
             }
@@ -439,9 +453,76 @@ fn roster(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn help_keys(app: &App) -> Vec<&'static str> {
+    let mut keys = vec![
+        "ctrl+n: notes",
+        "ctrl+u/d: log",
+        "ctrl+k: pass",
+        "ctrl+c: quit",
+    ];
+    if !app.notes_hidden {
+        keys.insert(0, "tab: panes");
+    }
+    if app.you == 0 && app.joined {
+        keys.insert(
+            0,
+            if app.state.phase == "lobby" {
+                "ctrl+s: start"
+            } else {
+                "ctrl+r: new round"
+            },
+        );
+    }
+    keys
+}
+
+fn wrap(items: &[&str], sep: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut lines = vec![String::new()];
+    for item in items {
+        let line = lines.last_mut().unwrap();
+        if line.is_empty() {
+            line.push_str(item);
+        } else if line.chars().count() + sep.chars().count() + item.chars().count() <= width {
+            line.push_str(sep);
+            line.push_str(item);
+        } else {
+            lines.push((*item).to_string());
+        }
+    }
+    lines
+}
+
 fn ui(frame: &mut Frame, app: &mut App) {
-    let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(frame.area());
+    let screen = frame.area();
+    let help_lines = {
+        let w = screen.width.saturating_sub(2);
+        if !app.err.is_empty() {
+            wrap(&app.err.split(' ').collect::<Vec<_>>(), " ", w)
+        } else if app.hotkeys_hidden {
+            Vec::new()
+        } else {
+            wrap(&help_keys(app), " · ", w)
+        }
+    };
+    let outer = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(help_lines.len() as u16),
+    ])
+    .split(screen);
+
+    let colour = if app.err.is_empty() { DIM } else { BAD };
+    let footer: Vec<Line> = help_lines
+        .into_iter()
+        .map(|l| Line::styled(l, Style::new().fg(colour)))
+        .collect();
+    frame.render_widget(Paragraph::new(footer), outer[1].inner(Margin::new(1, 0)));
+
+    let cols = if app.notes_hidden {
+        Layout::horizontal([Constraint::Percentage(100)]).split(outer[0])
+    } else {
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(outer[0])
+    };
     let status_lines = status(app);
     let roster_lines = roster(app);
     let rows = Layout::vertical([
@@ -449,7 +530,6 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Constraint::Length(status_lines.len() as u16 + 1),
         Constraint::Length(roster_lines.len() as u16 + 1),
         Constraint::Min(0),
-        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(cols[0].inner(Margin::new(1, 1)));
@@ -518,28 +598,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
     };
     frame.render_widget(Paragraph::new(entry), rows[4]);
 
-    let mut help = vec![
-        "tab: panes",
-        "ctrl+u/d: log",
-        "ctrl+k: pass",
-        "ctrl+c: quit",
-    ];
-    if app.you == 0 && app.joined {
-        help.insert(
-            0,
-            if app.state.phase == "lobby" {
-                "ctrl+s: start"
-            } else {
-                "ctrl+r: new round"
-            },
-        );
+    if app.notes_hidden {
+        app.notes_inner = Rect::ZERO;
+        if app.active() {
+            frame.set_cursor_position((rows[4].x + 2 + app.entry.col as u16, rows[4].y));
+        }
+        return;
     }
-    let help = if app.err.is_empty() {
-        Line::styled(help.join(" · "), Style::new().fg(DIM))
-    } else {
-        Line::styled(app.err.clone(), Style::new().fg(BAD))
-    };
-    frame.render_widget(Paragraph::new(help), rows[5]);
 
     let notes_block = Block::default()
         .borders(Borders::ALL)
@@ -628,17 +693,21 @@ fn fetch_public_ip(slot: Arc<Mutex<String>>) {
 fn main() -> std::io::Result<()> {
     let mut port = PORT.to_string();
     let mut addr = None;
+    let mut hide_notes = false;
+    let mut hide_hotkeys = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--hide-notes" => hide_notes = true,
+            "--hide-hotkeys" => hide_hotkeys = true,
             "-port" | "--port" if i + 1 < args.len() => {
                 port = args[i + 1].clone();
                 i += 1;
             }
             "-h" | "--help" => {
                 println!(
-                    "headband            host a game\nheadband ADDRESS    join one\n  -port PORT"
+                    "headband            host a game\nheadband ADDRESS    join one\n  -port PORT\n  --hide-notes  start with the notes pane hidden\n  --hide-hotkeys  start with the keybind footer hidden"
                 );
                 return Ok(());
             }
@@ -654,6 +723,8 @@ fn main() -> std::io::Result<()> {
     }
 
     let mut app = App::new(addr, port);
+    app.notes_hidden = hide_notes;
+    app.hotkeys_hidden = hide_hotkeys;
     if app.addr.is_none() {
         fetch_public_ip(app.pub_ip.clone());
     }
@@ -753,13 +824,31 @@ mod tests {
     }
 
     #[test]
-    fn input_and_help_stay_pinned_to_the_bottom() {
+    fn keybinds_are_a_full_width_footer_under_everything() {
         let lines = render(&mut playing(), 100, 40);
-        let row = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        let row = |n: &str| lines.iter().position(|l| l.contains(n));
         let entry = row("your guess").expect("no input line");
-        let help = row("ctrl+c: quit").expect("no help line");
-        assert!(entry >= lines.len() - 3, "input drifted up to row {entry}");
-        assert_eq!(help, entry + 1, "help should sit under the input");
+        let help = row("tab: panes").expect("no help line");
+        let pane_bottom = lines
+            .iter()
+            .rposition(|l| l.contains('└'))
+            .expect("no notes pane");
+
+        assert!(entry < pane_bottom, "input should sit inside the columns");
+        assert!(
+            help > pane_bottom,
+            "keybinds should be under the notes pane, not beside it"
+        );
+        assert_eq!(help, lines.len() - 1, "keybinds should be the last row");
+        assert!(
+            lines[help].trim_start().starts_with("tab: panes"),
+            "footer should start at the left edge: {:?}",
+            lines[help]
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("ctrl+c: quit")),
+            "the quit key must never be cut off"
+        );
     }
 
     #[test]
@@ -826,6 +915,110 @@ mod tests {
             app.max_log_scroll(),
             "ctrl+u stops at the oldest"
         );
+    }
+
+    #[test]
+    fn ctrl_n_hides_the_notes_and_gives_the_width_back() {
+        let mut app = playing();
+        let with = render(&mut app, 100, 20);
+        assert!(with.iter().any(|l| l.contains("NOTES")), "no notes pane");
+
+        app.on_key(ctrl('n'));
+        let without = render(&mut app, 100, 20);
+        assert!(app.notes_hidden);
+        assert!(
+            !without.iter().any(|l| l.contains("NOTES")),
+            "notes pane still drawn"
+        );
+        assert!(with.iter().any(|l| l.contains('│')), "no pane border");
+        assert!(
+            !without.iter().any(|l| l.contains('│')),
+            "pane border still drawn"
+        );
+
+        app.on_key(ctrl('n'));
+        assert!(!app.notes_hidden, "ctrl+n toggles back");
+    }
+
+    #[test]
+    fn help_wraps_instead_of_truncating_on_a_narrow_terminal() {
+        for width in [40u16, 60, 100, 200] {
+            let mut app = playing();
+            app.you = 0;
+            app.state.turn = 0;
+            let lines = render(&mut app, width, 24);
+            let joined = lines.join(" ");
+            for key in ["ctrl+r: new round", "ctrl+k: pass", "ctrl+c: quit"] {
+                assert!(joined.contains(key), "lost {key:?} at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_never_splits_a_key_in_half() {
+        let items = ["tab: panes", "ctrl+n: notes", "ctrl+c: quit"];
+        for width in [8u16, 20, 41, 200] {
+            let lines = wrap(&items, " · ", width);
+            for item in items {
+                assert!(
+                    lines.iter().any(|l| l.contains(item)),
+                    "{item:?} was split at width {width}"
+                );
+            }
+        }
+        assert_eq!(wrap(&items, " · ", 200).len(), 1, "no needless wrapping");
+    }
+
+    #[test]
+    fn hide_hotkeys_drops_the_footer_but_never_an_error() {
+        let mut app = playing();
+        app.hotkeys_hidden = true;
+        let lines = render(&mut app, 100, 40);
+        assert!(
+            !lines.iter().any(|l| l.contains("ctrl+c: quit")),
+            "footer should be gone"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("YOUR TURN") || l.contains("is asking")),
+            "the game should still render"
+        );
+
+        app.err = "connection lost".into();
+        let lines = render(&mut app, 100, 40);
+        assert!(
+            lines.iter().any(|l| l.contains("connection lost")),
+            "errors must show even with the footer hidden"
+        );
+    }
+
+    #[test]
+    fn hidden_notes_never_take_focus() {
+        let mut app = playing();
+        app.on_notes = true;
+        app.on_key(ctrl('n'));
+        assert!(!app.on_notes, "hiding must drop focus");
+
+        app.was_active = true;
+        app.state.turn = 0;
+        app.refocus();
+        assert!(!app.on_notes, "a turn change must not focus a hidden pane");
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!app.on_notes, "tab must not reach a hidden pane");
+    }
+
+    #[test]
+    fn typing_still_reaches_the_input_while_hidden() {
+        let mut app = playing();
+        app.state.turn = app.you;
+        app.on_key(ctrl('n'));
+        for c in "duck".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.entry.lines[0], "duck");
+        assert!(app.notes.is_empty(), "notes must not have swallowed it");
     }
 
     #[test]

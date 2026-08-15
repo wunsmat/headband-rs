@@ -14,7 +14,7 @@ use host::{Cmd, Player, State, TURN_LIMIT, Update, now_ms, serve};
 use notes::Notes;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -45,13 +45,12 @@ struct App {
     entry: Notes,
     notes: Notes,
     on_notes: bool,
-    was_active: bool,
     notes_inner: Rect,
     entry_rect: Rect,
     log_rect: Rect,
     log_scroll: usize,
     notes_hidden: bool,
-    hotkeys_hidden: bool,
+    mine_only: bool,
     quit: bool,
 }
 
@@ -73,13 +72,12 @@ impl App {
             entry: Notes::new(),
             notes: Notes::new(),
             on_notes: false,
-            was_active: true,
             notes_inner: Rect::ZERO,
             entry_rect: Rect::ZERO,
             log_rect: Rect::ZERO,
             log_scroll: 0,
             notes_hidden: false,
-            hotkeys_hidden: false,
+            mine_only: false,
             quit: false,
         }
     }
@@ -89,20 +87,23 @@ impl App {
             return true;
         }
         match self.state.phase.as_str() {
-            "assign" => self.target().thing.is_empty(),
+            "assign" => self.target().is_none_or(|p| p.thing.is_empty()),
             "play" => self.state.turn == self.you,
             _ => false,
         }
     }
 
-    fn target(&self) -> Player {
-        if self.state.assigns.len() != self.state.players.len() {
-            return Player::default();
-        }
-        match self.state.assigns.get(self.you) {
-            Some(&t) if t >= 0 => self.state.players[t as usize].clone(),
-            _ => Player::default(),
-        }
+    fn can_type(&self) -> bool {
+        !self.joined || self.state.phase != "lobby"
+    }
+
+    fn target(&self) -> Option<&Player> {
+        let &t = self.state.assigns.get(self.you)?;
+        self.state.players.get(usize::try_from(t).ok()?)
+    }
+
+    fn target_name(&self) -> &str {
+        self.target().map_or("", |p| p.name.as_str())
     }
 
     fn connect(&mut self, name: &str) -> std::io::Result<()> {
@@ -153,6 +154,10 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if !self.active() {
+            self.flash = "not your turn yet, this waits here.".into();
+            return;
+        }
         self.entry.lines[0].clear();
         self.entry.col = 0;
         if !self.joined {
@@ -181,18 +186,14 @@ impl App {
             }
         }
         if let Some(u) = latest {
+            let new_round = u.state.phase == "assign"
+                && (self.state.phase != "assign" || u.state.log.len() < self.state.log.len());
             self.state = u.state;
             self.you = u.you;
             self.joined = true;
-            self.refocus();
-        }
-    }
-
-    fn refocus(&mut self) {
-        let now = self.active();
-        if now != self.was_active {
-            self.was_active = now;
-            self.on_notes = !now && !self.notes_hidden;
+            if new_round {
+                self.entry = Notes::new();
+            }
         }
     }
 
@@ -200,7 +201,7 @@ impl App {
         self.flash.clear();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('q') if ctrl => self.quit = true,
             KeyCode::Char(c @ ('s' | 'r' | 'k')) if ctrl => {
                 let cmd = match c {
                     's' => "start",
@@ -218,6 +219,10 @@ impl App {
                     self.on_notes = false;
                 }
             }
+            KeyCode::Char('g') if ctrl => {
+                self.mine_only = !self.mine_only;
+                self.log_scroll = 0;
+            }
             KeyCode::Char('u') if ctrl => {
                 self.log_scroll = (self.log_scroll + self.log_page()).min(self.max_log_scroll())
             }
@@ -225,7 +230,7 @@ impl App {
                 self.log_scroll = self.log_scroll.saturating_sub(self.log_page())
             }
             KeyCode::Tab => {
-                if self.active() && !self.notes_hidden {
+                if !self.notes_hidden {
                     self.on_notes = !self.on_notes;
                 }
             }
@@ -238,7 +243,7 @@ impl App {
     }
 
     fn entry_key(&mut self, k: KeyEvent) {
-        if !self.active() {
+        if !self.can_type() {
             return;
         }
         if k.code == KeyCode::Enter {
@@ -252,9 +257,16 @@ impl App {
         (self.log_rect.height as usize / 2).max(1)
     }
 
-    fn max_log_scroll(&self) -> usize {
+    fn log_lines(&self) -> Vec<&String> {
         self.state
             .log
+            .iter()
+            .filter(|l| !self.mine_only || speaker(&self.state, l) == Some(self.you))
+            .collect()
+    }
+
+    fn max_log_scroll(&self) -> usize {
+        self.log_lines()
             .len()
             .saturating_sub(self.log_rect.height as usize)
     }
@@ -302,7 +314,7 @@ impl App {
                 self.notes.drag_to(x, y, self.notes_inner);
             }
             MouseEventKind::Down(MouseButton::Left)
-                if self.entry_rect.contains(Position::new(x, y)) && self.active() =>
+                if self.entry_rect.contains(Position::new(x, y)) && self.can_type() =>
             {
                 self.on_notes = false;
                 let dx = x.saturating_sub(self.entry_rect.x + 2) as usize;
@@ -331,6 +343,10 @@ fn edit(n: &mut Notes, k: KeyEvent) {
         End => n.end(),
         _ => {}
     }
+}
+
+fn speaker(state: &State, line: &str) -> Option<usize> {
+    state.players.iter().position(|p| line.starts_with(&p.name))
 }
 
 fn clock(state: &State) -> Line<'static> {
@@ -391,25 +407,16 @@ fn status(app: &App) -> Vec<Line<'static>> {
             lines
         }
         "assign" => {
-            if !app.target().thing.is_empty() {
+            if app.target().is_some_and(|p| !p.thing.is_empty()) {
                 vec![Line::styled("Sent. Waiting for everyone else.", dim)]
             } else {
                 vec![Line::styled(
-                    format!("You assign {}. What are they?", app.target().name),
+                    format!("You assign {}. What are they?", app.target_name()),
                     accent,
                 )]
             }
         }
         "play" => {
-            if p[app.you].done {
-                return vec![
-                    Line::styled(
-                        format!(" YOU GOT IT: {} ", p[app.you].thing),
-                        Style::new().fg(Color::Black).bg(Color::Green).bold(),
-                    ),
-                    Line::styled("Hang around and watch the others suffer.", dim),
-                ];
-            }
             let mut head = if app.state.turn == app.you {
                 vec![Span::styled("YOUR TURN", accent), Span::raw("  ")]
             } else {
@@ -420,7 +427,19 @@ fn status(app: &App) -> Vec<Line<'static>> {
             };
             head.extend(clock(&app.state).spans);
             let mut lines = vec![Line::from(head)];
-            if app.state.turn == app.you {
+            if p[app.you].done {
+                lines.insert(
+                    0,
+                    Line::styled(
+                        format!(" YOU GOT IT: {} ", p[app.you].thing),
+                        Style::new().fg(Color::Black).bg(Color::Green).bold(),
+                    ),
+                );
+                lines.push(Line::styled(
+                    "Hang around and watch the others suffer.",
+                    dim,
+                ));
+            } else if app.state.turn == app.you {
                 lines.push(Line::styled(
                     "ask your yes/no question, then type a guess, or ctrl+k to pass.",
                     dim,
@@ -486,8 +505,9 @@ fn help_keys(app: &App) -> Vec<&'static str> {
     let mut keys = vec![
         "ctrl+n: notes",
         "ctrl+u/d: log",
+        "ctrl+g: just me",
         "ctrl+k: pass",
-        "ctrl+c: quit",
+        "ctrl+q: quit",
     ];
     if !app.notes_hidden {
         keys.insert(0, "tab: panes");
@@ -531,12 +551,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
         } else {
             (&app.err, BAD)
         };
-        if !msg.is_empty() {
-            (wrap(&msg.split(' ').collect::<Vec<_>>(), " ", w), colour)
-        } else if app.hotkeys_hidden {
-            (Vec::new(), DIM)
-        } else {
+        if msg.is_empty() {
             (wrap(&help_keys(app), " · ", w), DIM)
+        } else {
+            (wrap(&msg.split(' ').collect::<Vec<_>>(), " ", w), colour)
         }
     };
     let outer = Layout::vertical([
@@ -598,8 +616,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
     app.log_rect = rows[3];
     let fits = rows[3].height as usize;
     app.log_scroll = app.log_scroll.min(app.max_log_scroll());
-    let end = app.state.log.len() - app.log_scroll;
-    let mut log: Vec<Line> = app.state.log[end.saturating_sub(fits)..end]
+    let shown = app.log_lines();
+    let end = shown.len() - app.log_scroll;
+    let mut log: Vec<Line> = shown[end.saturating_sub(fits)..end]
         .iter()
         .map(|l| {
             if l.ends_with('✓') {
@@ -608,7 +627,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Style::new().fg(Color::Black).bg(Color::Green).bold(),
                 )
             } else {
-                Line::styled(l.clone(), Style::new().fg(DIM))
+                let mine = speaker(&app.state, l) == Some(app.you);
+                Line::styled((*l).clone(), Style::new().fg(if mine { MINE } else { DIM }))
             }
         })
         .collect();
@@ -625,79 +645,77 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(log), rows[3]);
 
     app.entry_rect = rows[4];
-    let entry = if app.active() {
+    let held = !app.active();
+    let dim = Style::new().fg(DIM);
+    let mut spans = vec![];
+    if !app.can_type() {
+    } else if app.entry.lines[0].is_empty() {
+        spans.push(Span::styled("> ", dim));
         let hint = if !app.joined {
             "your name".to_string()
+        } else if held {
+            "queue your next guess".to_string()
         } else if app.state.phase == "assign" {
-            format!("what {} is", app.target().name)
+            format!("what {} is", app.target_name())
         } else {
             "your guess".to_string()
         };
-        if app.entry.lines[0].is_empty() {
-            Line::from(vec![
-                Span::raw("> "),
-                Span::styled(hint, Style::new().fg(DIM)),
-            ])
-        } else {
-            Line::raw(format!("> {}", app.entry.lines[0]))
-        }
+        spans.push(Span::styled(hint, dim));
     } else {
-        Line::styled(
-            "  (nothing to type, you're taking notes)",
-            Style::new().fg(DIM),
-        )
-    };
+        spans.push(Span::styled("> ", if held { dim } else { Style::new() }));
+        spans.push(Span::raw(app.entry.lines[0].clone()));
+        if held {
+            spans.push(Span::styled("  waiting for your turn", dim));
+        }
+    }
+    let entry = Line::from(spans);
     frame.render_widget(Paragraph::new(entry), rows[4]);
 
-    if app.notes_hidden {
-        app.notes_inner = Rect::ZERO;
-        if app.active() {
-            frame.set_cursor_position((rows[4].x + 2 + app.entry.col as u16, rows[4].y));
+    app.notes_inner = Rect::ZERO;
+    if !app.notes_hidden {
+        let notes_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(if app.on_notes { ACCENT } else { DIM }))
+            .title(Span::styled(" NOTES ", Style::new().fg(ACCENT).bold()));
+        let inner = notes_block.inner(cols[1]);
+        app.notes_inner = inner;
+        frame.render_widget(notes_block, cols[1]);
+
+        if app.notes.is_empty() && !app.on_notes {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "click here to take notes",
+                    Style::new().fg(DIM),
+                )),
+                inner,
+            );
+        } else {
+            let top = app.notes.scroll;
+            let rows = (app.notes.lines.len() - top).min(inner.height as usize);
+            let selected = Style::new().fg(Color::Black).bg(ACCENT);
+            let visible: Vec<Line> = (top..top + rows)
+                .map(|i| {
+                    Line::from(
+                        app.notes
+                            .segments(i)
+                            .into_iter()
+                            .map(|(text, sel)| {
+                                Span::styled(text, if sel { selected } else { Style::new() })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(visible), inner);
         }
-        return;
     }
 
-    let notes_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(if app.on_notes { ACCENT } else { DIM }))
-        .title(Span::styled(" NOTES ", Style::new().fg(ACCENT).bold()));
-    let inner = notes_block.inner(cols[1]);
-    app.notes_inner = inner;
-    frame.render_widget(notes_block, cols[1]);
-
-    if app.notes.is_empty() && !app.on_notes {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "click here to take notes",
-                Style::new().fg(DIM),
-            )),
-            inner,
-        );
-    } else {
-        let top = app.notes.scroll;
-        let rows = (app.notes.lines.len() - top).min(inner.height as usize);
-        let selected = Style::new().fg(Color::Black).bg(ACCENT);
-        let visible: Vec<Line> = (top..top + rows)
-            .map(|i| {
-                Line::from(
-                    app.notes
-                        .segments(i)
-                        .into_iter()
-                        .map(|(text, sel)| {
-                            Span::styled(text, if sel { selected } else { Style::new() })
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(visible), inner);
-    }
-
+    let inner = app.notes_inner;
     if app.on_notes {
         if let Some((x, y)) = app.notes.cursor_at(inner) {
             frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), y));
         }
-    } else if app.active() {
+    } else if app.can_type() {
         frame.set_cursor_position((rows[4].x + 2 + app.entry.col as u16, rows[4].y));
     }
 }
@@ -723,18 +741,13 @@ fn fetch_public_ip(slot: Arc<Mutex<String>>) {
         {
             return;
         }
-        let mut body = String::new();
-        let mut reader = BufReader::new(s);
-        let mut line = String::new();
-        while reader.read_line(&mut line).unwrap_or(0) > 0 {
-            if line.trim().is_empty() {
-                body.clear();
-                let _ = reader.read_line(&mut body);
-                break;
-            }
-            line.clear();
-        }
-        let ip = body.trim().to_string();
+        let mut resp = String::new();
+        let _ = BufReader::new(s).read_to_string(&mut resp);
+        let ip = resp
+            .split_once("\r\n\r\n")
+            .map_or("", |(_, b)| b)
+            .trim()
+            .to_string();
         if !ip.is_empty() && ip.len() < 46 {
             *slot.lock().unwrap() = ip;
         }
@@ -745,20 +758,14 @@ fn main() -> std::io::Result<()> {
     let mut port = PORT.to_string();
     let mut addr = None;
     let mut hide_notes = false;
-    let mut hide_hotkeys = false;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
             "--hide-notes" => hide_notes = true,
-            "--hide-hotkeys" => hide_hotkeys = true,
-            "-port" | "--port" if i + 1 < args.len() => {
-                port = args[i + 1].clone();
-                i += 1;
-            }
+            "-port" | "--port" => port = args.next().unwrap_or(port),
             "-h" | "--help" => {
                 println!(
-                    "headband            host a game\nheadband ADDRESS    join one\n  -port PORT\n  --hide-notes  start with the notes pane hidden\n  --hide-hotkeys  start with the keybind footer hidden"
+                    "headband            host a game\nheadband ADDRESS    join one\n  -port PORT\n  --hide-notes  start with the notes pane hidden"
                 );
                 return Ok(());
             }
@@ -770,12 +777,10 @@ fn main() -> std::io::Result<()> {
                 })
             }
         }
-        i += 1;
     }
 
     let mut app = App::new(addr, port);
     app.notes_hidden = hide_notes;
-    app.hotkeys_hidden = hide_hotkeys;
     if app.addr.is_none() {
         fetch_public_ip(app.pub_ip.clone());
     }
@@ -904,7 +909,7 @@ mod tests {
             lines[help]
         );
         assert!(
-            lines.iter().any(|l| l.contains("ctrl+c: quit")),
+            lines.iter().any(|l| l.contains("ctrl+q: quit")),
             "the quit key must never be cut off"
         );
     }
@@ -1006,7 +1011,7 @@ mod tests {
             app.state.turn = 0;
             let lines = render(&mut app, width, 24);
             let joined = lines.join(" ");
-            for key in ["ctrl+r: new round", "ctrl+k: pass", "ctrl+c: quit"] {
+            for key in ["ctrl+r: new round", "ctrl+k: pass", "ctrl+q: quit"] {
                 assert!(joined.contains(key), "lost {key:?} at width {width}");
             }
         }
@@ -1014,7 +1019,7 @@ mod tests {
 
     #[test]
     fn wrap_never_splits_a_key_in_half() {
-        let items = ["tab: panes", "ctrl+n: notes", "ctrl+c: quit"];
+        let items = ["tab: panes", "ctrl+n: notes", "ctrl+q: quit"];
         for width in [8u16, 20, 41, 200] {
             let lines = wrap(&items, " · ", width);
             for item in items {
@@ -1028,26 +1033,17 @@ mod tests {
     }
 
     #[test]
-    fn hide_hotkeys_drops_the_footer_but_never_an_error() {
+    fn an_error_replaces_the_footer() {
         let mut app = playing();
-        app.hotkeys_hidden = true;
-        let lines = render(&mut app, 100, 40);
-        assert!(
-            !lines.iter().any(|l| l.contains("ctrl+c: quit")),
-            "footer should be gone"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("YOUR TURN") || l.contains("is asking")),
-            "the game should still render"
-        );
-
         app.err = "connection lost".into();
         let lines = render(&mut app, 100, 40);
         assert!(
             lines.iter().any(|l| l.contains("connection lost")),
-            "errors must show even with the footer hidden"
+            "the error never showed"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("ctrl+q: quit")),
+            "the footer should give way to the error"
         );
     }
 
@@ -1057,11 +1053,6 @@ mod tests {
         app.on_notes = true;
         app.on_key(ctrl('n'));
         assert!(!app.on_notes, "hiding must drop focus");
-
-        app.was_active = true;
-        app.state.turn = 0;
-        app.refocus();
-        assert!(!app.on_notes, "a turn change must not focus a hidden pane");
 
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(!app.on_notes, "tab must not reach a hidden pane");
@@ -1129,6 +1120,156 @@ mod tests {
         app.state.phase = "play".into();
         render(&mut app, 100, 20);
         assert!(app.share.is_empty(), "stale rows must not stay clickable");
+    }
+
+    #[test]
+    fn finished_players_still_see_the_clock() {
+        let mut app = playing();
+        app.you = 0;
+        app.state.turn = 1;
+        let joined = render(&mut app, 100, 20).join("\n");
+        assert!(joined.contains("YOU GOT IT: B"), "lost the winner banner");
+        assert!(joined.contains("Todd is asking."), "no whose-turn line");
+        assert!(joined.contains("72s"), "no clock: {joined}");
+    }
+
+    #[test]
+    fn my_log_lines_stand_out_and_ctrl_g_keeps_only_mine() {
+        let mut app = playing();
+        app.state.log = vec![
+            "Matt guessed \"cat\": nope.".into(),
+            "Todd passed.".into(),
+            "Todd guessed \"dog\": nope.".into(),
+        ];
+        render(&mut app, 100, 20);
+        let (row, x) = (app.log_rect.y, app.log_rect.x as usize);
+        assert_eq!(
+            styles(&mut app, 100, 20, row)[x].fg,
+            Some(DIM),
+            "someone else's line should stay dim"
+        );
+        assert_eq!(
+            styles(&mut app, 100, 20, row + 2)[x].fg,
+            Some(MINE),
+            "my own line should stand out"
+        );
+
+        app.on_key(ctrl('g'));
+        let joined = render(&mut app, 100, 20).join("\n");
+        assert!(
+            !joined.contains("Matt guessed"),
+            "someone else's line stayed"
+        );
+        assert!(joined.contains("dog"), "lost my guess");
+        assert!(joined.contains("Todd passed."), "all my lines should show");
+
+        app.on_key(ctrl('g'));
+        let joined = render(&mut app, 100, 20).join("\n");
+        assert!(joined.contains("Matt guessed"), "ctrl+g toggles back");
+    }
+
+    #[test]
+    fn the_lobby_has_no_input_until_the_host_starts() {
+        let mut app = App::new(None, "7777".into());
+        app.joined = true;
+        app.state.phase = "lobby".into();
+        app.state.players = vec![Player {
+            name: "Matt".into(),
+            ..Default::default()
+        }];
+        let lines = render(&mut app, 100, 20);
+        let row = app.entry_rect.y as usize;
+        assert!(
+            !lines[row].contains('>'),
+            "still prompting: {:?}",
+            lines[row]
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            app.entry.lines[0].is_empty(),
+            "the lobby swallowed a keystroke"
+        );
+
+        app.state.phase = "assign".into();
+        let lines = render(&mut app, 100, 20);
+        assert!(
+            lines[row].contains('>'),
+            "no prompt once the game starts: {:?}",
+            lines[row]
+        );
+    }
+
+    #[test]
+    fn a_new_round_clears_a_queued_guess() {
+        let mut app = playing();
+        let (tx, rx) = channel();
+        app.rx = Some(rx);
+        let send = |phase: &str, app: &App| {
+            let mut state = app.state.clone();
+            state.phase = phase.into();
+            tx.send(Update {
+                state,
+                you: app.you,
+            })
+            .unwrap();
+        };
+
+        app.entry.lines[0] = "duck".into();
+        app.entry.col = 4;
+        send("assign", &app);
+        app.drain();
+        assert!(app.entry.lines[0].is_empty(), "a stale guess survived");
+        assert_eq!(app.entry.col, 0, "the cursor kept the old column");
+
+        app.entry.lines[0] = "cat".into();
+        send("assign", &app);
+        app.drain();
+        assert_eq!(
+            app.entry.lines[0], "cat",
+            "only a new round should clear it"
+        );
+
+        send("assign", &app);
+        app.state.log.push("stale".into());
+        app.drain();
+        assert!(
+            app.entry.lines[0].is_empty(),
+            "a restart mid-assign wipes the log, so it is a new round too"
+        );
+    }
+
+    #[test]
+    fn tab_swaps_panes_off_turn_too() {
+        let mut app = playing();
+        app.state.turn = 0;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.on_notes, "tab should still reach the notes");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!app.on_notes, "tab should come back to the input");
+    }
+
+    #[test]
+    fn a_guess_waits_for_your_turn() {
+        let mut app = playing();
+        app.state.turn = 0;
+        for c in "duck".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.entry.lines[0], "duck",
+            "the queued guess was thrown away"
+        );
+        let joined = render(&mut app, 100, 20).join("\n");
+        assert!(
+            joined.contains("waiting for your turn"),
+            "nothing says it cannot send yet: {joined}"
+        );
+
+        app.state.turn = app.you;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.entry.lines[0].is_empty(), "your turn should send it");
     }
 
     #[test]

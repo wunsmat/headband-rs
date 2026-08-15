@@ -172,7 +172,7 @@ impl Notes {
 
     pub fn click(&mut self, x: u16, y: u16, inner: Rect) {
         self.move_to(x, y, inner);
-        self.anchor = Some((self.row, self.col));
+        self.anchor = None;
     }
 
     pub fn drag_to(&mut self, x: u16, y: u16, inner: Rect) {
@@ -292,23 +292,6 @@ mod tests {
         n.follow(2);
         assert_eq!(n.cursor_at(inner), Some((0, 1)));
     }
-}
-
-#[cfg(test)]
-mod selection_tests {
-    use super::*;
-
-    fn typed(s: &str) -> Notes {
-        let mut n = Notes::new();
-        for ch in s.chars() {
-            if ch == '\n' {
-                n.newline()
-            } else {
-                n.insert(ch)
-            }
-        }
-        n
-    }
 
     const INNER: Rect = Rect {
         x: 0,
@@ -383,6 +366,20 @@ mod selection_tests {
         assert_eq!(
             n.segments(2),
             vec![("th".into(), true), ("ree".into(), false)]
+        );
+    }
+
+    #[test]
+    fn typing_after_a_click_does_not_eat_itself() {
+        let mut n = typed("hello");
+        n.click(2, 0, INNER);
+        n.insert('X');
+        assert_eq!(n.selection(), None, "a bare click must select nothing");
+        n.insert('Y');
+        assert_eq!(
+            n.lines,
+            vec!["heXYllo"],
+            "the second letter overwrote the first"
         );
     }
 

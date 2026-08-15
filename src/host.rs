@@ -203,16 +203,14 @@ impl Host {
         self.broadcast();
     }
 
-    fn contenders(&self) -> usize {
-        self.state
+    fn arm(&mut self) {
+        let contenders = self
+            .state
             .players
             .iter()
             .filter(|p| !p.done && !p.off)
-            .count()
-    }
-
-    fn arm(&mut self) {
-        self.state.deadline = if self.contenders() > 1 {
+            .count();
+        self.state.deadline = if contenders > 1 {
             now_ms() + self.limit.as_millis() as i64
         } else {
             0

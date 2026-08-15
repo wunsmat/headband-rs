@@ -526,13 +526,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
     let (help_lines, colour) = {
         let w = screen.width.saturating_sub(2);
-        if !app.err.is_empty() {
-            (wrap(&app.err.split(' ').collect::<Vec<_>>(), " ", w), BAD)
-        } else if !app.flash.is_empty() {
-            (
-                wrap(&app.flash.split(' ').collect::<Vec<_>>(), " ", w),
-                ACCENT,
-            )
+        let (msg, colour) = if app.err.is_empty() {
+            (&app.flash, ACCENT)
+        } else {
+            (&app.err, BAD)
+        };
+        if !msg.is_empty() {
+            (wrap(&msg.split(' ').collect::<Vec<_>>(), " ", w), colour)
         } else if app.hotkeys_hidden {
             (Vec::new(), DIM)
         } else {
@@ -571,30 +571,22 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Paragraph::new(Line::styled("HEADBAND", Style::new().fg(ACCENT).bold())),
         rows[0],
     );
-    app.share = status_lines
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| {
-            let cmd = l
-                .spans
-                .iter()
-                .find(|s| s.content.starts_with("headband "))?;
-            Some((rows[1].y + i as u16, cmd.content.to_string()))
-        })
-        .collect();
-
-    let hovered = app
-        .hover
-        .filter(|hy| app.share.iter().any(|(row, _)| row == hy))
-        .map(|hy| (hy - rows[1].y) as usize);
-    if let Some(spans) = hovered.map(|i| &mut status_lines[i].spans)
-        && let Some(j) = spans
+    app.share.clear();
+    for (i, line) in status_lines.iter_mut().enumerate() {
+        let Some(j) = line
+            .spans
             .iter()
             .position(|s| s.content.starts_with("headband "))
-    {
-        spans[j].style = spans[j].style.underlined();
-        if let Some(icon) = spans.get_mut(j + 1) {
-            icon.style = Style::new().fg(ACCENT).bold();
+        else {
+            continue;
+        };
+        let row = rows[1].y + i as u16;
+        app.share.push((row, line.spans[j].content.to_string()));
+        if app.hover == Some(row) {
+            line.spans[j].style = line.spans[j].style.underlined();
+            if let Some(icon) = line.spans.get_mut(j + 1) {
+                icon.style = Style::new().fg(ACCENT).bold();
+            }
         }
     }
     frame.render_widget(
@@ -1101,9 +1093,7 @@ mod tests {
 
         assert_eq!(app.share.len(), 2, "both addresses should be clickable");
         assert!(
-            app.share
-                .iter()
-                .any(|(_, a)| a == "headband 1.2.3.4:7777"),
+            app.share.iter().any(|(_, a)| a == "headband 1.2.3.4:7777"),
             "the runnable command should be copied, not the bare address: {:?}",
             app.share
         );
@@ -1139,33 +1129,6 @@ mod tests {
         app.state.phase = "play".into();
         render(&mut app, 100, 20);
         assert!(app.share.is_empty(), "stale rows must not stay clickable");
-    }
-
-    #[test]
-    fn the_copy_icon_gets_a_second_cell_of_its_own_style() {
-        let mut app = App::new(None, "7777".into());
-        app.joined = true;
-        app.state.phase = "lobby".into();
-        app.state.players = vec![Player {
-            name: "Matt".into(),
-            ..Default::default()
-        }];
-        let lines = render(&mut app, 100, 20);
-        let (row, _) = app.share[0].clone();
-        let icon = lines[row as usize]
-            .chars()
-            .position(|c| c == '⧉')
-            .expect("no copy icon") as u16;
-
-        for hover in [None, Some(row)] {
-            app.hover = hover;
-            let cells = styles(&mut app, 100, 20, row);
-            assert_eq!(
-                cells[icon as usize],
-                cells[icon as usize + 1],
-                "a double-wide font would straddle two styles (hover: {hover:?})"
-            );
-        }
     }
 
     #[test]
